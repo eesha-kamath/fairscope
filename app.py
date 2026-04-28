@@ -558,12 +558,35 @@ with st.sidebar:
         if uploaded_file is not None:
             df_raw = pd.read_csv(uploaded_file)
         else:
-            sample_path = "data/adult_income_sample.csv"
-            if not os.path.exists(sample_path):
-                os.makedirs("data", exist_ok=True)
-                import subprocess
-                subprocess.run(["python", "generate_sample_data.py"], capture_output=True)
-            df_raw = pd.read_csv(sample_path) if os.path.exists(sample_path) else None
+            # Check multiple possible locations for the sample CSV
+            _base = os.path.dirname(os.path.abspath(__file__))
+            possible_paths = [
+                os.path.join(_base, "data", "adult_income_sample.csv"),
+                os.path.join(_base, "adult_income_sample.csv"),
+                "data/adult_income_sample.csv",
+                "adult_income_sample.csv",
+            ]
+            sample_path = next((p for p in possible_paths if os.path.exists(p)), None)
+            if sample_path is not None:
+                df_raw = pd.read_csv(sample_path)
+            else:
+                # Generate sample data in-memory (no subprocess needed on cloud)
+                _rng = np.random.RandomState(42)
+                _n = 1000
+                _ages = _rng.randint(18, 70, _n)
+                _edu = _rng.randint(5, 16, _n)
+                _hrs = _rng.randint(20, 60, _n)
+                _sex = _rng.choice(["Male", "Female"], _n, p=[0.67, 0.33])
+                _race = _rng.choice(["White","Black","Asian-Pac-Islander","Amer-Indian-Eskimo","Other"], _n, p=[0.85,0.095,0.03,0.01,0.015])
+                _wc = _rng.choice(["Private","Self-emp-not-inc","Self-emp-inc","Federal-gov","Local-gov","State-gov","Without-pay"], _n, p=[0.70,0.08,0.05,0.04,0.06,0.05,0.02])
+                _ms = [_rng.choice(["Married-civ-spouse","Never-married","Divorced","Separated","Widowed"], p=([0.55,0.25,0.12,0.04,0.04] if g=="Male" else [0.40,0.30,0.18,0.05,0.07])) for g in _sex]
+                _occ = [_rng.choice(["Exec-managerial","Craft-repair","Prof-specialty","Sales","Transport-moving","Handlers-cleaners","Tech-support","Other-service"], p=([0.17,0.20,0.15,0.12,0.10,0.08,0.08,0.10] if g=="Male" else [0.12,0.04,0.18,0.10,0.02,0.03,0.12,0.39])) for g in _sex]
+                _rel = [_rng.choice(["Husband","Not-in-family","Own-child","Unmarried","Wife","Other-relative"], p=([0.50,0.25,0.10,0.06,0.01,0.08] if g=="Male" else [0.01,0.25,0.12,0.25,0.30,0.07])) for g in _sex]
+                _cg = np.where(_rng.rand(_n) < 0.1, _rng.randint(1000, 50000, _n), 0)
+                _cl = np.where(_rng.rand(_n) < 0.05, _rng.randint(100, 4000, _n), 0)
+                _ip = np.clip(0.10 + 0.18*(_sex=="Male") + 0.05*(_race=="White") + 0.02*(_edu-9) + 0.003*_hrs + 0.001*_ages, 0.02, 0.95)
+                _inc = np.where(_rng.rand(_n) < _ip, ">50K", "<=50K")
+                df_raw = pd.DataFrame({"age":_ages,"workclass":_wc,"education_num":_edu,"marital_status":_ms,"occupation":_occ,"relationship":_rel,"race":_race,"sex":_sex,"capital_gain":_cg,"capital_loss":_cl,"hours_per_week":_hrs,"income":_inc})
         if df_raw is not None:
             st.session_state.df = df_raw
             st.markdown(f'<p style="color: #72BAA9; font-size: 0.78rem;">{len(df_raw):,} rows x {len(df_raw.columns)} cols loaded</p>', unsafe_allow_html=True)

@@ -74,8 +74,14 @@ def compute_mutual_information(df: pd.DataFrame, target_col: str, sensitive_cols
     df_enc, _ = encode_dataframe(df)
     feature_cols = [c for c in df_enc.columns if c != target_col]
 
-    X = df_enc[feature_cols].fillna(0)
+    X = df_enc[feature_cols].fillna(0).astype(np.float64)
     y = df_enc[target_col].fillna(0)
+
+    # Ensure y is numeric
+    if y.dtype == object or str(y.dtype) == 'category':
+        le = LabelEncoder()
+        y = pd.Series(le.fit_transform(y.astype(str)), index=y.index)
+    y = y.astype(np.float64)
 
     is_classification = y.nunique() <= 20
 
@@ -94,12 +100,20 @@ def compute_mutual_information(df: pd.DataFrame, target_col: str, sensitive_cols
         if sens not in df_enc.columns:
             continue
         y_sens = df_enc[sens].fillna(0)
-        X_other = df_enc[[c for c in feature_cols if c != sens]].fillna(0)
+        # Ensure y_sens is numeric
+        if y_sens.dtype == object or str(y_sens.dtype) == 'category':
+            le = LabelEncoder()
+            y_sens = pd.Series(le.fit_transform(y_sens.astype(str)), index=y_sens.index)
+        y_sens = y_sens.astype(np.float64)
+
+        other_features = [c for c in feature_cols if c != sens]
+        X_other = df_enc[other_features].fillna(0).astype(np.float64)
+
         if y_sens.nunique() <= 20:
             proxy_scores = mutual_info_classif(X_other, y_sens, random_state=42)
         else:
             proxy_scores = mutual_info_regression(X_other, y_sens, random_state=42)
-        other_features = [c for c in feature_cols if c != sens]
+
         temp = pd.DataFrame({'feature': other_features, f'mi_proxy_{sens}': proxy_scores})
         mi_df = mi_df.merge(temp, on='feature', how='left')
 
@@ -149,10 +163,14 @@ def compute_intersectional_risk(df: pd.DataFrame, feature_pairs: list, sensitive
             if sens not in df_enc.columns:
                 continue
             y_sens = df_enc[sens].fillna(0)
+            if y_sens.dtype == object or str(y_sens.dtype) == 'category':
+                le_s = LabelEncoder()
+                y_sens = pd.Series(le_s.fit_transform(y_sens.astype(str)), index=y_sens.index)
+            y_sens = y_sens.astype(np.float64)
             if y_sens.nunique() < 2:
                 continue
-            mi_individual_f1 = mutual_info_classif(df_enc[[f1]], y_sens, random_state=42)[0]
-            mi_individual_f2 = mutual_info_classif(df_enc[[f2]], y_sens, random_state=42)[0]
+            mi_individual_f1 = mutual_info_classif(df_enc[[f1]].astype(np.float64), y_sens, random_state=42)[0]
+            mi_individual_f2 = mutual_info_classif(df_enc[[f2]].astype(np.float64), y_sens, random_state=42)[0]
             mi_combined = mutual_info_classif(
                 pd.DataFrame({'interaction': interaction_enc}), y_sens, random_state=42
             )[0]
