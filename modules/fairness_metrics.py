@@ -7,8 +7,7 @@ and quantifies accuracy-fairness trade-offs.
 
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score
@@ -93,64 +92,106 @@ CONFLICT_MATRIX = {
 }
 
 
-def encode_features(df: pd.DataFrame, target_col: str, sensitive_col: str) -> tuple:
-    df_work = df.copy()
-    encoders = {}
+def _strip_arrow(series: pd.Series) -> pd.Series:
+    """Strip Arrow backing from a pandas Series so dtype operations work on Python 3.14."""
+    try:
+        return series.astype(object)
+    except Exception:
+        return series
 
+
+def _to_numeric_series(series: pd.Series) -> pd.Series:
+    """Convert a Series to float64, label-encoding if it contains strings."""
+    series = _strip_arrow(series)
+    try:
+        return pd.to_numeric(series, errors='raise').astype(np.float64)
+    except (ValueError, TypeError):
+        le = LabelEncoder()
+        return pd.Series(
+            le.fit_transform(series.fillna('__missing__').astype(str)).astype(np.float64),
+            index=series.index
+        )
+
+
+def _encode_df_to_float(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Convert every column in df to float64, safely handling Arrow-backed
+    string columns (Python 3.14 / Streamlit Cloud) and all other dtypes.
+    """
+    out = pd.DataFrame(index=df.index)
+    for col in df.columns:
+        out[col] = _to_numeric_series(df[col])
+    return out
+
+
+def encode_features(df: pd.DataFrame, target_col: str, sensitive_col: str):
+    """Encode all columns, return X, y, s as numpy-ready float64 DataFrames."""
+    df_work = df.copy()
+
+    # Strip Arrow backing from every column first
     for col in df_work.columns:
-        if df_work[col].dtype == object or df_work[col].dtype.name == 'category':
+        df_work[col] = _strip_arrow(df_work[col])
+
+    encoders = {}
+    for col in df_work.columns:
+        series = df_work[col]
+        is_non_numeric = (
+            series.dtype == object
+            or str(series.dtype).startswith('string')
+            or series.dtype.name == 'category'
+        )
+        if is_non_numeric:
             le = LabelEncoder()
-            df_work[col] = le.fit_transform(df_work[col].astype(str))
+            df_work[col] = le.fit_transform(series.fillna('__missing__').astype(str))
             encoders[col] = le
+        else:
+            df_work[col] = pd.to_numeric(series, errors='coerce').fillna(0)
 
     feature_cols = [c for c in df_work.columns if c not in [target_col, sensitive_col]]
-    X = df_work[feature_cols].fillna(0)
-    y = df_work[target_col].fillna(0)
-    s = df_work[sensitive_col].fillna(0)
+    X = _encode_df_to_float(df_work[feature_cols].fillna(0))
+    y = _to_numeric_series(df_work[target_col].fillna(0))
+    s = _to_numeric_series(df_work[sensitive_col].fillna(0))
 
     return X, y, s, encoders
 
 
 def train_base_model(X_train, y_train):
+    # Ensure pure numpy arrays reach sklearn
+    X_np = np.array(X_train, dtype=np.float64)
+    y_np = np.array(y_train, dtype=np.float64)
     model = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
-    model.fit(X_train, y_train)
+    model.fit(X_np, y_np)
     return model
 
 
-def compute_group_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray, group_mask: np.ndarray) -> dict:
-    group_true = y_true[group_mask]
-    group_pred = y_pred[group_mask]
-    group_prob = y_prob[group_mask]
+def compute_group_metrics(y_true, y_pred, y_prob, group_mask):
+    gt = np.array(y_true)[group_mask]
+    gp = np.array(y_pred)[group_mask]
+    gprob = np.array(y_prob)[group_mask]
 
-    if len(group_true) == 0:
+    if len(gt) == 0:
         return {}
 
-    positive_rate = group_pred.mean()
-    tp = ((group_pred == 1) & (group_true == 1)).sum()
-    fp = ((group_pred == 1) & (group_true == 0)).sum()
-    fn = ((group_pred == 0) & (group_true == 1)).sum()
-    tn = ((group_pred == 0) & (group_true == 0)).sum()
+    tp = int(((gp == 1) & (gt == 1)).sum())
+    fp = int(((gp == 1) & (gt == 0)).sum())
+    fn = int(((gp == 0) & (gt == 1)).sum())
+    tn = int(((gp == 0) & (gt == 0)).sum())
 
     tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     ppv = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-    base_rate = group_true.mean()
-
-    # Calibration: correlation between predicted prob and actual outcome
-    if len(group_prob) > 1:
-        cal = np.abs(group_prob.mean() - base_rate)
-    else:
-        cal = 0.0
+    base_rate = float(gt.mean())
+    cal = float(abs(gprob.mean() - base_rate)) if len(gprob) > 1 else 0.0
 
     return {
-        'n': int(len(group_true)),
-        'positive_rate': round(float(positive_rate), 4),
-        'true_positive_rate': round(float(tpr), 4),
-        'false_positive_rate': round(float(fpr), 4),
-        'positive_predictive_value': round(float(ppv), 4),
-        'base_rate': round(float(base_rate), 4),
-        'calibration_error': round(float(cal), 4),
-        'accuracy': round(float(accuracy_score(group_true, group_pred)), 4)
+        'n': int(len(gt)),
+        'positive_rate': round(float(gp.mean()), 4),
+        'true_positive_rate': round(tpr, 4),
+        'false_positive_rate': round(fpr, 4),
+        'positive_predictive_value': round(ppv, 4),
+        'base_rate': round(base_rate, 4),
+        'calibration_error': round(cal, 4),
+        'accuracy': round(float(accuracy_score(gt, gp)), 4)
     }
 
 
@@ -158,82 +199,83 @@ def compute_all_fairness_metrics(
     df: pd.DataFrame,
     target_col: str,
     sensitive_col: str,
-    privileged_group_value: str = None
+    privileged_group_value=None
 ) -> dict:
+
     X, y, s, encoders = encode_features(df, target_col, sensitive_col)
 
+    # Convert everything to plain numpy before sklearn
+    X_np = X.values.astype(np.float64)
+    y_np = y.values.astype(np.float64)
+    s_np = s.values.astype(np.float64)
+
     X_train, X_test, y_train, y_test, s_train, s_test = train_test_split(
-        X, y, s, test_size=0.3, random_state=42, stratify=y
+        X_np, y_np, s_np, test_size=0.3, random_state=42,
+        stratify=y_np
     )
 
-    model = train_base_model(X_train, y_train)
+    model = GradientBoostingClassifier(n_estimators=100, max_depth=4, random_state=42)
+    model.fit(X_train, y_train)
+
     y_pred = model.predict(X_test)
     y_prob = model.predict_proba(X_test)[:, 1]
 
     overall_accuracy = accuracy_score(y_test, y_pred)
     overall_auc = roc_auc_score(y_test, y_prob)
 
-    # Identify privileged group
-    unique_groups = s_test.unique()
+    unique_groups = np.unique(s_test)
     group_counts = pd.Series(s_test).value_counts()
-    if privileged_group_value is not None:
-        if sensitive_col in encoders:
-            priv_encoded = encoders[sensitive_col].transform([str(privileged_group_value)])[0]
-        else:
-            priv_encoded = privileged_group_value
+
+    if privileged_group_value is not None and sensitive_col in encoders:
+        try:
+            priv_encoded = float(encoders[sensitive_col].transform([str(privileged_group_value)])[0])
+        except Exception:
+            priv_encoded = float(group_counts.idxmax())
         privileged_group = priv_encoded
     else:
-        privileged_group = group_counts.idxmax()
+        privileged_group = float(group_counts.idxmax())
 
     unprivileged_groups = [g for g in unique_groups if g != privileged_group]
 
-    # Get group label names
     if sensitive_col in encoders:
-        group_label_map = {v: k for k, v in zip(encoders[sensitive_col].classes_, encoders[sensitive_col].transform(encoders[sensitive_col].classes_))}
+        le = encoders[sensitive_col]
+        group_label_map = {
+            float(le.transform([cls])[0]): cls
+            for cls in le.classes_
+        }
     else:
-        group_label_map = {g: str(g) for g in unique_groups}
+        group_label_map = {float(g): str(g) for g in unique_groups}
 
-    # Compute per-group metrics
     group_metrics = {}
     for g in unique_groups:
-        mask = (s_test == g).values
-        group_metrics[group_label_map.get(g, str(g))] = compute_group_metrics(
-            y_test.values, y_pred, y_prob, mask
-        )
+        mask = (s_test == g)
+        label = group_label_map.get(float(g), str(g))
+        group_metrics[label] = compute_group_metrics(y_test, y_pred, y_prob, mask)
 
-    priv_label = group_label_map.get(privileged_group, str(privileged_group))
+    priv_label = group_label_map.get(float(privileged_group), str(privileged_group))
     priv_metrics = group_metrics.get(priv_label, {})
 
-    # Compute fairness metric differences (privileged vs worst unprivileged)
     fairness_metrics = {}
     for unpriv_g in unprivileged_groups:
-        unpriv_label = group_label_map.get(unpriv_g, str(unpriv_g))
+        unpriv_label = group_label_map.get(float(unpriv_g), str(unpriv_g))
         unpriv_metrics = group_metrics.get(unpriv_label, {})
         if not unpriv_metrics or not priv_metrics:
             continue
-
         fairness_metrics[unpriv_label] = {
             'demographic_parity_difference': round(
-                priv_metrics.get('positive_rate', 0) - unpriv_metrics.get('positive_rate', 0), 4
-            ),
-            'equalized_odds_difference': round(
-                max(
-                    abs(priv_metrics.get('true_positive_rate', 0) - unpriv_metrics.get('true_positive_rate', 0)),
-                    abs(priv_metrics.get('false_positive_rate', 0) - unpriv_metrics.get('false_positive_rate', 0))
-                ), 4
-            ),
+                priv_metrics.get('positive_rate', 0) - unpriv_metrics.get('positive_rate', 0), 4),
+            'equalized_odds_difference': round(max(
+                abs(priv_metrics.get('true_positive_rate', 0) - unpriv_metrics.get('true_positive_rate', 0)),
+                abs(priv_metrics.get('false_positive_rate', 0) - unpriv_metrics.get('false_positive_rate', 0))
+            ), 4),
             'equal_opportunity_difference': round(
-                priv_metrics.get('true_positive_rate', 0) - unpriv_metrics.get('true_positive_rate', 0), 4
-            ),
+                priv_metrics.get('true_positive_rate', 0) - unpriv_metrics.get('true_positive_rate', 0), 4),
             'predictive_parity_difference': round(
-                abs(priv_metrics.get('positive_predictive_value', 0) - unpriv_metrics.get('positive_predictive_value', 0)), 4
-            ),
+                abs(priv_metrics.get('positive_predictive_value', 0) - unpriv_metrics.get('positive_predictive_value', 0)), 4),
             'calibration_difference': round(
-                abs(priv_metrics.get('calibration_error', 0) - unpriv_metrics.get('calibration_error', 0)), 4
-            )
+                abs(priv_metrics.get('calibration_error', 0) - unpriv_metrics.get('calibration_error', 0)), 4)
         }
 
-    # Aggregate worst-case differences across all unprivileged groups
     if fairness_metrics:
         aggregate_metrics = {}
         for metric in list(fairness_metrics.values())[0].keys():
@@ -242,7 +284,6 @@ def compute_all_fairness_metrics(
     else:
         aggregate_metrics = {m: 0.0 for m in METRIC_DESCRIPTIONS}
 
-    # Detect conflicts
     detected_conflicts = []
     metric_keys = list(aggregate_metrics.keys())
     for i in range(len(metric_keys)):
@@ -253,8 +294,8 @@ def compute_all_fairness_metrics(
             if conflict:
                 m1_val = abs(aggregate_metrics[metric_keys[i]])
                 m2_val = abs(aggregate_metrics[metric_keys[j]])
-                if m1_val > METRIC_DESCRIPTIONS[metric_keys[i]]['threshold'] or \
-                   m2_val > METRIC_DESCRIPTIONS[metric_keys[j]]['threshold']:
+                if (m1_val > METRIC_DESCRIPTIONS[metric_keys[i]]['threshold'] or
+                        m2_val > METRIC_DESCRIPTIONS[metric_keys[j]]['threshold']):
                     detected_conflicts.append({
                         'metric_1': metric_keys[i],
                         'metric_2': metric_keys[j],
@@ -263,8 +304,10 @@ def compute_all_fairness_metrics(
                         **conflict
                     })
 
-    # Accuracy-fairness trade-off: estimate cost of enforcing each metric
-    tradeoffs = estimate_accuracy_tradeoffs(model, X_train, y_train, X_test, y_test, s_test, aggregate_metrics, overall_accuracy)
+    tradeoffs = estimate_accuracy_tradeoffs(
+        model, X_train, y_train, X_test, y_test, s_test,
+        aggregate_metrics, overall_accuracy
+    )
 
     return {
         'model': model,
@@ -278,7 +321,7 @@ def compute_all_fairness_metrics(
         'detected_conflicts': detected_conflicts,
         'tradeoffs': tradeoffs,
         'privileged_group': priv_label,
-        'unprivileged_groups': [group_label_map.get(g, str(g)) for g in unprivileged_groups],
+        'unprivileged_groups': [group_label_map.get(float(g), str(g)) for g in unprivileged_groups],
         'sensitive_col': sensitive_col,
         'target_col': target_col,
         'n_test': len(y_test),
@@ -289,31 +332,28 @@ def compute_all_fairness_metrics(
     }
 
 
-def estimate_accuracy_tradeoffs(model, X_train, y_train, X_test, y_test, s_test, aggregate_metrics, baseline_accuracy) -> dict:
-    """
-    Estimate accuracy cost of enforcing each fairness criterion via threshold adjustment.
-    """
+def estimate_accuracy_tradeoffs(model, X_train, y_train, X_test, y_test, s_test, aggregate_metrics, baseline_accuracy):
     tradeoffs = {}
-    y_prob = model.predict_proba(X_test)[:, 1]
-    unique_groups = s_test.unique()
+    X_test_np = np.array(X_test, dtype=np.float64)
+    y_test_np = np.array(y_test, dtype=np.float64)
+    s_test_np = np.array(s_test, dtype=np.float64)
+
+    y_prob = model.predict_proba(X_test_np)[:, 1]
+    mode_group = float(pd.Series(s_test_np).mode()[0])
 
     for metric_name, metric_val in aggregate_metrics.items():
         if abs(metric_val) < 0.01:
             tradeoffs[metric_name] = {'accuracy_cost_pct': 0.0, 'feasible': True}
             continue
 
-        # Simulate threshold adjustment per group to equalize metric
         best_cost = 99.0
         for threshold_adj in np.linspace(-0.3, 0.3, 30):
-            y_pred_adjusted = []
-            for i, (prob, group) in enumerate(zip(y_prob, s_test)):
-                if group == s_test.mode()[0]:
-                    y_pred_adjusted.append(1 if prob > 0.5 else 0)
-                else:
-                    y_pred_adjusted.append(1 if prob > (0.5 + threshold_adj) else 0)
-
-            adj_accuracy = accuracy_score(y_test, y_pred_adjusted)
-            cost = (baseline_accuracy - adj_accuracy) * 100
+            y_pred_adj = np.where(
+                s_test_np == mode_group,
+                (y_prob > 0.5).astype(int),
+                (y_prob > (0.5 + threshold_adj)).astype(int)
+            )
+            cost = (baseline_accuracy - accuracy_score(y_test_np, y_pred_adj)) * 100
             if 0 <= cost < best_cost:
                 best_cost = cost
 

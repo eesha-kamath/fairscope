@@ -14,46 +14,41 @@ import warnings
 warnings.filterwarnings('ignore')
 
 
-COUNTERFACTUAL_TEMPLATES = {
-    'hiring': {
-        'description': 'Tests if identical candidate profiles receive different hiring scores based on inferred demographic signals.',
-        'sensitive_signals': {
-            'sex': {
-                'marital_status': {'Male': 'Married-civ-spouse', 'Female': 'Divorced'},
-                'relationship': {'Male': 'Husband', 'Female': 'Wife'},
-                'occupation': {'Male': 'Craft-repair', 'Female': 'Other-service'},
-            },
-            'race': {
-                'workclass': {'White': 'Self-emp-inc', 'Black': 'Private'},
-            }
-        }
-    },
-    'lending': {
-        'description': 'Tests if identical loan applications receive different scores based on neighborhood or name proxies.',
-        'sensitive_signals': {
-            'sex': {
-                'marital_status': {'Male': 'Single', 'Female': 'Married'},
-            },
-            'race': {
-                'zip_code': {'White': '10001', 'Black': '60619'},
-            }
-        }
-    }
-}
+def _strip_arrow(series: pd.Series) -> pd.Series:
+    """Strip Arrow backing from pandas Series (Python 3.14 / Streamlit Cloud)."""
+    try:
+        return series.astype(object)
+    except Exception:
+        return series
 
 
-def encode_single_row(row: pd.Series, df_reference: pd.DataFrame) -> pd.Series:
-    """Encode a single row using reference dataframe label encoders."""
-    row_encoded = row.copy()
-    for col in df_reference.columns:
-        if df_reference[col].dtype == object or df_reference[col].dtype.name == 'category':
-            le = LabelEncoder()
-            le.fit(df_reference[col].astype(str))
+def _safe_encode_value(encoders: dict, col: str, val):
+    """Encode a single value using stored encoders, with fallback."""
+    if col not in encoders:
+        try:
+            return float(val)
+        except (ValueError, TypeError):
+            return 0.0
+    try:
+        return float(encoders[col].transform([str(val)])[0])
+    except (ValueError, KeyError):
+        return 0.0
+
+
+def _encode_row_to_array(row: pd.Series, feature_cols: list, encoders: dict) -> np.ndarray:
+    """Encode a single dataframe row into a float64 numpy array."""
+    result = []
+    for col in feature_cols:
+        raw = row.get(col, 0)
+        if col in encoders:
+            val = _safe_encode_value(encoders, col, raw)
+        else:
             try:
-                row_encoded[col] = le.transform([str(row[col])])[0]
-            except ValueError:
-                row_encoded[col] = 0
-    return row_encoded
+                val = float(raw)
+            except (ValueError, TypeError):
+                val = 0.0
+        result.append(val)
+    return np.array(result, dtype=np.float64).reshape(1, -1)
 
 
 def run_counterfactual_test(
@@ -66,52 +61,32 @@ def run_counterfactual_test(
     feature_cols: list,
     encoders: dict
 ) -> dict:
-    """
-    Run a single counterfactual: change one feature, observe outcome change.
-    """
-    # Encode base record
-    base_encoded = {}
-    for col in feature_cols:
-        val = base_record.get(col, 0)
-        if col in encoders:
-            try:
-                val = encoders[col].transform([str(val)])[0]
-            except (ValueError, KeyError):
-                val = 0
-        base_encoded[col] = val
+    """Run a single counterfactual: change one feature, observe outcome change."""
+    base_arr = _encode_row_to_array(base_record, feature_cols, encoders)
+    cf_arr = base_arr.copy()
 
-    # Create counterfactual record
-    cf_encoded = base_encoded.copy()
-    if feature_to_change in encoders:
-        try:
-            cf_encoded[feature_to_change] = encoders[feature_to_change].transform([str(counterfactual_value)])[0]
-        except (ValueError, KeyError):
-            cf_encoded[feature_to_change] = 0
-    else:
-        cf_encoded[feature_to_change] = counterfactual_value
+    # Find index of feature to change
+    if feature_to_change in feature_cols:
+        idx = feature_cols.index(feature_to_change)
+        cf_arr[0, idx] = _safe_encode_value(encoders, feature_to_change, counterfactual_value)
 
-    base_df = pd.DataFrame([base_encoded])[feature_cols]
-    cf_df = pd.DataFrame([cf_encoded])[feature_cols]
-
-    base_pred = model.predict(base_df)[0]
-    cf_pred = model.predict(cf_df)[0]
-    base_prob = model.predict_proba(base_df)[0][1]
-    cf_prob = model.predict_proba(cf_df)[0][1]
-
-    outcome_changed = base_pred != cf_pred
+    base_pred = int(model.predict(base_arr)[0])
+    cf_pred   = int(model.predict(cf_arr)[0])
+    base_prob = float(model.predict_proba(base_arr)[0][1])
+    cf_prob   = float(model.predict_proba(cf_arr)[0][1])
     prob_delta = cf_prob - base_prob
 
     return {
         'feature_changed': feature_to_change,
         'original_value': original_value,
         'counterfactual_value': counterfactual_value,
-        'original_prediction': int(base_pred),
-        'counterfactual_prediction': int(cf_pred),
-        'original_probability': round(float(base_prob), 4),
-        'counterfactual_probability': round(float(cf_prob), 4),
-        'probability_delta': round(float(prob_delta), 4),
-        'outcome_changed': bool(outcome_changed),
-        'bias_signal': abs(prob_delta) > 0.05 or outcome_changed
+        'original_prediction': base_pred,
+        'counterfactual_prediction': cf_pred,
+        'original_probability': round(base_prob, 4),
+        'counterfactual_probability': round(cf_prob, 4),
+        'probability_delta': round(prob_delta, 4),
+        'outcome_changed': base_pred != cf_pred,
+        'bias_signal': abs(prob_delta) > 0.05 or base_pred != cf_pred
     }
 
 
@@ -123,48 +98,30 @@ def run_multifeature_counterfactual(
     feature_cols: list,
     encoders: dict
 ) -> dict:
-    """
-    Change multiple features simultaneously to test combined proxy effects.
-    feature_changes: [{'feature': str, 'original': val, 'changed': val}, ...]
-    """
-    base_encoded = {}
-    for col in feature_cols:
-        val = base_record.get(col, 0)
-        if col in encoders:
-            try:
-                val = encoders[col].transform([str(val)])[0]
-            except (ValueError, KeyError):
-                val = 0
-        base_encoded[col] = val
+    """Change multiple features simultaneously to test combined proxy effects."""
+    base_arr = _encode_row_to_array(base_record, feature_cols, encoders)
+    cf_arr = base_arr.copy()
 
-    cf_encoded = base_encoded.copy()
     for change in feature_changes:
         feat = change['feature']
         new_val = change['changed']
-        if feat in encoders:
-            try:
-                cf_encoded[feat] = encoders[feat].transform([str(new_val)])[0]
-            except (ValueError, KeyError):
-                cf_encoded[feat] = 0
-        else:
-            cf_encoded[feat] = new_val
+        if feat in feature_cols:
+            idx = feature_cols.index(feat)
+            cf_arr[0, idx] = _safe_encode_value(encoders, feat, new_val)
 
-    base_df = pd.DataFrame([base_encoded])[feature_cols]
-    cf_df = pd.DataFrame([cf_encoded])[feature_cols]
-
-    base_pred = model.predict(base_df)[0]
-    cf_pred = model.predict(cf_df)[0]
-    base_prob = model.predict_proba(base_df)[0][1]
-    cf_prob = model.predict_proba(cf_df)[0][1]
+    base_pred = int(model.predict(base_arr)[0])
+    cf_pred   = int(model.predict(cf_arr)[0])
+    base_prob = float(model.predict_proba(base_arr)[0][1])
+    cf_prob   = float(model.predict_proba(cf_arr)[0][1])
 
     return {
         'feature_changes': feature_changes,
-        'original_prediction': int(base_pred),
-        'counterfactual_prediction': int(cf_pred),
-        'original_probability': round(float(base_prob), 4),
-        'counterfactual_probability': round(float(cf_prob), 4),
+        'original_prediction': base_pred,
+        'counterfactual_prediction': cf_pred,
+        'original_probability': round(base_prob, 4),
+        'counterfactual_probability': round(cf_prob, 4),
         'probability_delta': round(float(cf_prob - base_prob), 4),
-        'outcome_changed': bool(base_pred != cf_pred),
+        'outcome_changed': base_pred != cf_pred,
         'bias_signal': abs(cf_prob - base_prob) > 0.05 or base_pred != cf_pred
     }
 
@@ -182,22 +139,25 @@ def run_systematic_probe(
     """
     Systematic black-box audit:
     1. Sample N records from the dataset
-    2. For each record, run counterfactuals changing high-risk proxy features
-    3. Aggregate how often outcome changes, and by how much
+    2. For each, run counterfactuals changing high-risk proxy features
+    3. Aggregate how often outcome changes and by how much
     """
-    df_features = df.drop(columns=[target_col] + [c for c in sensitive_cols if c in df.columns], errors='ignore')
+    # Strip Arrow backing from the entire dataframe upfront
+    df_clean = df.copy()
+    for col in df_clean.columns:
+        df_clean[col] = _strip_arrow(df_clean[col])
 
-    sample_size = min(n_samples, len(df))
-    sample_df = df.sample(sample_size, random_state=42)
+    sample_size = min(n_samples, len(df_clean))
+    sample_df = df_clean.sample(sample_size, random_state=42)
 
     all_results = []
     feature_impact_summary = {}
 
     for feat in high_risk_features[:6]:
-        if feat not in df.columns:
+        if feat not in df_clean.columns:
             continue
 
-        unique_vals = df[feat].dropna().unique()
+        unique_vals = df_clean[feat].dropna().unique().tolist()
         if len(unique_vals) < 2:
             continue
 
@@ -209,7 +169,7 @@ def run_systematic_probe(
             for val_a, val_b in val_pairs:
                 try:
                     result = run_counterfactual_test(
-                        model, row, df,
+                        model, row, df_clean,
                         feat, val_a, val_b,
                         feature_cols, encoders
                     )
@@ -221,23 +181,25 @@ def run_systematic_probe(
                     continue
 
         total_tests = sample_size * len(val_pairs)
+        mean_delta = float(np.mean(feat_prob_deltas)) if feat_prob_deltas else 0.0
+        change_rate = feat_outcomes_changed / max(total_tests, 1)
+
         feature_impact_summary[feat] = {
-            'outcome_change_rate': round(feat_outcomes_changed / max(total_tests, 1), 4),
-            'mean_prob_delta': round(np.mean(feat_prob_deltas) if feat_prob_deltas else 0.0, 4),
+            'outcome_change_rate': round(change_rate, 4),
+            'mean_prob_delta': round(mean_delta, 4),
             'max_prob_delta': round(max(feat_prob_deltas) if feat_prob_deltas else 0.0, 4),
-            'bias_detected': (feat_outcomes_changed / max(total_tests, 1)) > 0.10 or
-                             (np.mean(feat_prob_deltas) if feat_prob_deltas else 0) > 0.05
+            'bias_detected': change_rate > 0.10 or mean_delta > 0.05
         }
 
-    # Multi-feature combined probe (simulate full demographic flip)
+    # Multi-feature combined probe
     combined_probe_results = []
-    sensitive_linked_features = [f for f in high_risk_features if f in feature_impact_summary][:3]
+    sensitive_linked = [f for f in high_risk_features if f in feature_impact_summary][:3]
 
-    if len(sensitive_linked_features) >= 2 and sensitive_cols:
+    if len(sensitive_linked) >= 2 and sensitive_cols:
         for _, row in sample_df.head(20).iterrows():
             changes = []
-            for feat in sensitive_linked_features:
-                unique_vals = df[feat].dropna().unique()
+            for feat in sensitive_linked:
+                unique_vals = df_clean[feat].dropna().unique().tolist()
                 if len(unique_vals) >= 2:
                     original = row.get(feat)
                     other_vals = [v for v in unique_vals if v != original]
@@ -247,26 +209,34 @@ def run_systematic_probe(
                             'original': original,
                             'changed': other_vals[0]
                         })
-
             if len(changes) >= 2:
                 try:
                     result = run_multifeature_counterfactual(
-                        model, row, df, changes, feature_cols, encoders
+                        model, row, df_clean, changes, feature_cols, encoders
                     )
                     combined_probe_results.append(result)
                 except Exception:
                     continue
 
-    combined_bias_rate = sum(1 for r in combined_probe_results if r['outcome_changed']) / max(len(combined_probe_results), 1)
-    combined_mean_delta = np.mean([abs(r['probability_delta']) for r in combined_probe_results]) if combined_probe_results else 0.0
+    combined_bias_rate = (
+        sum(1 for r in combined_probe_results if r['outcome_changed']) /
+        max(len(combined_probe_results), 1)
+    )
+    combined_mean_delta = (
+        float(np.mean([abs(r['probability_delta']) for r in combined_probe_results]))
+        if combined_probe_results else 0.0
+    )
 
     return {
         'feature_impact_summary': feature_impact_summary,
         'all_single_feature_results': all_results,
         'combined_probe_results': combined_probe_results,
-        'combined_bias_rate': round(float(combined_bias_rate), 4),
-        'combined_mean_prob_delta': round(float(combined_mean_delta), 4),
+        'combined_bias_rate': round(combined_bias_rate, 4),
+        'combined_mean_prob_delta': round(combined_mean_delta, 4),
         'total_tests_run': len(all_results) + len(combined_probe_results),
-        'overall_bias_detected': any(v['bias_detected'] for v in feature_impact_summary.values()) or combined_bias_rate > 0.10,
+        'overall_bias_detected': (
+            any(v['bias_detected'] for v in feature_impact_summary.values()) or
+            combined_bias_rate > 0.10
+        ),
         'high_risk_features_tested': list(feature_impact_summary.keys())
     }
